@@ -28,6 +28,14 @@ def _ensure_deps():
         deps.append("opencv-python-headless")
     if deps:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + deps, check=True)
+        # Force reimport of newly installed packages in this process
+        # so background threads (backfill, SigLIP loader) don't hit ImportError
+        import importlib
+        for mod in ["sentencepiece", "google.protobuf"]:
+            try:
+                importlib.import_module(mod)
+            except Exception:
+                pass
 
 _ensure_deps()
 
@@ -292,7 +300,10 @@ async def register_with_id(
 ):
     """
     Register a new user and optionally verify their university ID.
-    Returns the normal auth response plus badge: 'student' | 'staff' | 'none'.
+    Account is created immediately. If an ID image is provided, the badge
+    check runs in a background thread and is pushed to the client via SSE
+    so the response is never blocked by slow model loading.
+    Returns: {token, profile, badge: 'pending'|'none'}
     """
     uid = uid.strip().lower()
     pw  = password.strip()
@@ -310,39 +321,73 @@ async def register_with_id(
         db.close()
         raise HTTPException(409, "Username already taken")
 
-    # ── Detect badge from ID image ────────────────────────────────────────
-    badge = "none"
-    if id_file and id_file.filename:
-        try:
-            img_bytes = await id_file.read()
-            if img_bytes:
-                result = _siglip_check_id(img_bytes)
-                if result.get("is_id"):
-                    role = result.get("detected_role", "unknown")
-                    if role in ("student", "staff"):
-                        badge = role
-                    else:
-                        badge = "verified"   # valid ID but couldn't distinguish role
-                print(f"[register] uid={uid} id_check={result.get('is_id')} role={result.get('detected_role')} → badge={badge}")
-        except Exception as e:
-            print(f"[register] id check error: {e}")
-
-    pid      = str(uuid.uuid4())
-    name     = (name.strip() or uid)
-    initials = name[:2].upper()
-    color    = pick_color(uid)
+    pid        = str(uuid.uuid4())
+    name       = (name.strip() or uid)
+    initials   = name[:2].upper()
+    color      = pick_color(uid)
     user_count = db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
     role_val   = "super_admin" if user_count == 0 else "user"
 
-    db.execute("INSERT INTO profiles (id,uid,name,initials,color,role,badge) VALUES (?,?,?,?,?,?,?)",
-               (pid, uid, name, initials, color, role_val, badge))
+    # Read ID image bytes before DB insert (file stream can't be read in a thread)
+    img_bytes = None
+    has_id_file = id_file and id_file.filename
+    if has_id_file:
+        try:
+            img_bytes = await id_file.read()
+            if not img_bytes:
+                img_bytes = None
+        except Exception:
+            img_bytes = None
+
+    # Create account with badge='none' immediately — don't block on ID check
+    db.execute(
+        "INSERT INTO profiles (id,uid,name,initials,color,role,badge) VALUES (?,?,?,?,?,?,?)",
+        (pid, uid, name, initials, color, role_val, "none")
+    )
     db.execute("INSERT INTO passwords (user_id,hash) VALUES (?,?)",
                (pid, hash_password(pw)))
     db.commit()
     profile = dict(db.execute("SELECT * FROM profiles WHERE id=?", (pid,)).fetchone())
     db.close()
     token = create_session(pid)
-    return {"token": token, "profile": profile, "badge": badge}
+
+    # Run ID verification in background — push badge via SSE when done
+    if img_bytes:
+        def _verify_and_push(user_uid: str, user_id: str, image_bytes: bytes):
+            try:
+                result = _siglip_check_id(image_bytes)
+                print(f"[register-bg] uid={user_uid} is_id={result.get('is_id')} role={result.get('detected_role')}")
+                if result.get("is_id"):
+                    detected = result.get("detected_role", "unknown")
+                    badge    = detected if detected in ("student", "staff") else "verified"
+                else:
+                    badge = "none"
+
+                if badge != "none":
+                    db2 = get_db()
+                    db2.execute("UPDATE profiles SET badge=? WHERE id=?", (badge, user_id))
+                    db2.commit()
+                    db2.close()
+                    print(f"[register-bg] ✅ badge={badge} → uid={user_uid}")
+                    # Push to the user's SSE channel so the frontend updates live
+                    broker.publish(f"user:{user_uid}", {
+                        "type":    "badge_granted",
+                        "badge":   badge,
+                        "message": f"{'🎓 Student' if badge == 'student' else '🏫 Staff' if badge == 'staff' else '✅ Verified'} badge added to your profile!",
+                    })
+            except Exception as e:
+                print(f"[register-bg] id check error: {e}")
+
+        threading.Thread(
+            target=_verify_and_push,
+            args=(uid, pid, img_bytes),
+            daemon=True
+        ).start()
+        badge_status = "pending"
+    else:
+        badge_status = "none"
+
+    return {"token": token, "profile": profile, "badge": badge_status}
 
 @app.post("/auth/login")
 async def login(data: dict):
@@ -608,13 +653,9 @@ async def report_comment(comment_id: str, request: Request, user=Depends(require
     if comment["author_id"] == user["id"]: raise HTTPException(403, "Cannot report own comment")
     if user["role"] in ("admin","super_admin"): raise HTTPException(403, "Admins cannot report")
     data   = await request.json()
-    # Use INSERT OR REPLACE so re-reporting the same comment refreshes the row
-    # rather than being silently dropped. The UNIQUE key now includes reason,
-    # so a comment report never conflicts with a post report on the same post.
-    reason_str = f'comment:{comment_id}:{data.get("reason","")}'
     db.execute(
         "INSERT OR REPLACE INTO reports (id,post_id,reporter_id,reason) VALUES (?,?,?,?)",
-        (str(uuid.uuid4()), comment["post_id"], user["id"], reason_str)
+        (str(uuid.uuid4()), comment["post_id"], user["id"], f'comment:{comment_id}:{data.get("reason","")}')
     )
     db.commit(); db.close()
     return {"ok": True}
@@ -803,7 +844,6 @@ async def report_post(post_id: str, request: Request, user=Depends(require_user)
     if not post: raise HTTPException(404)
     if post["author_id"] == user["id"]: raise HTTPException(403, "Cannot report your own post")
     data = await request.json()
-    # INSERT OR REPLACE: idempotent — re-reporting the same post just refreshes the row.
     db.execute(
         "INSERT OR REPLACE INTO reports (id,post_id,reporter_id,reason) VALUES (?,?,?,?)",
         (str(uuid.uuid4()), post_id, user["id"], data.get("reason",""))
@@ -1089,28 +1129,50 @@ async def verify_badge(
     file: UploadFile = File(...),
     user=Depends(require_user),
 ):
-    """Let a logged-in user upload their university ID to get a student/staff badge."""
+    """
+    Let a logged-in user upload their university ID to get a student/staff badge.
+    Runs the ID check in a background thread and pushes the result via SSE so
+    the response returns immediately without blocking the event loop.
+    """
     img_bytes = await file.read()
-    db = get_db()
-    try:
-        result = _siglip_check_id(img_bytes)
-        print(f"[verify-badge] uid={user['uid']} is_id={result.get('is_id')} role={result.get('detected_role')}")
+    if not img_bytes:
+        return {"ok": False, "badge": "none", "message": "No image received."}
 
-        if not result.get("is_id"):
-            return {"ok": False, "badge": "none", "message": "Could not verify this as a university ID. Make sure the card is clearly visible."}
+    def _run(user_id: str, user_uid: str, image_bytes: bytes):
+        try:
+            result = _siglip_check_id(image_bytes)
+            print(f"[verify-badge] uid={user_uid} is_id={result.get('is_id')} role={result.get('detected_role')}")
+            if not result.get("is_id"):
+                broker.publish(f"user:{user_uid}", {
+                    "type":    "badge_result",
+                    "ok":      False,
+                    "badge":   "none",
+                    "message": "Could not verify this as a university ID. Make sure the card is clearly visible.",
+                })
+                return
+            detected = result.get("detected_role", "unknown")
+            badge    = detected if detected in ("student", "staff") else "verified"
+            db2 = get_db()
+            db2.execute("UPDATE profiles SET badge=? WHERE id=?", (badge, user_id))
+            db2.commit(); db2.close()
+            print(f"[verify-badge] ✅ badge={badge} → uid={user_uid}")
+            broker.publish(f"user:{user_uid}", {
+                "type":    "badge_result",
+                "ok":      True,
+                "badge":   badge,
+                "message": f"{'🎓 Student' if badge == 'student' else '🏫 Staff' if badge == 'staff' else '✅ Verified'} badge added!",
+            })
+        except Exception as e:
+            print(f"[verify-badge] error: {e}")
+            broker.publish(f"user:{user_uid}", {
+                "type":    "badge_result",
+                "ok":      False,
+                "badge":   "none",
+                "message": "Verification failed. Please try again.",
+            })
 
-        detected = result.get("detected_role", "unknown")
-        badge = detected if detected in ("student", "staff") else "verified"
-
-        db.execute("UPDATE profiles SET badge=? WHERE id=?", (badge, user["id"]))
-        db.commit()
-        print(f"[verify-badge] ✅ badge={badge} granted to uid={user['uid']}")
-        return {"ok": True, "badge": badge, "message": f"{'🎓 Student' if badge == 'student' else '🏫 Staff' if badge == 'staff' else '✅ Verified'} badge added!"}
-    except Exception as e:
-        print(f"[verify-badge] error: {e}")
-        return {"ok": False, "badge": "none", "message": "Verification failed. Please try again."}
-    finally:
-        db.close()
+    threading.Thread(target=_run, args=(user["id"], user["uid"], img_bytes), daemon=True).start()
+    return {"ok": "pending", "message": "Verifying your ID…"}
 
 @app.post("/admin/requests")
 async def submit_admin_request(request: Request):
@@ -1278,7 +1340,17 @@ async def upload_checked(file: UploadFile = File(...), user=Depends(require_user
 
 # ── Module-level auto-match worker (avoids closure capture bug) ──────────────
 def _run_auto_match(post_id: str, emb_json, siglip_json, opp: str, author_uid: str):
-    """Run in a thread. All args passed by value so concurrent calls are safe."""
+    """Run in a thread. All args passed by value so concurrent calls are safe.
+
+    Scoring strategy:
+    - SigLIP image↔image is semantically aware — threshold 0.25 catches genuine
+      visual similarity (same object type/color) while rejecting unrelated images.
+    - DINOv2 is a patch-level feature extractor, not semantic — it can score high
+      for a car vs an ID card if they share background/lighting. Only use it as a
+      fallback when a post has no SigLIP embedding yet (uploaded before backfill),
+      and apply a stricter threshold of 0.50 to avoid false positives.
+    - Never mix models: if SigLIP embedding exists on either side, use SigLIP only.
+    """
     try:
         qvec_dino   = json.loads(emb_json)    if emb_json    else None
         qvec_siglip = json.loads(siglip_json) if siglip_json else None
@@ -1293,17 +1365,19 @@ def _run_auto_match(post_id: str, emb_json, siglip_json, opp: str, author_uid: s
         scored = []
         for r in rows:
             try:
-                sim = 0.0
-                # Compute with whatever embeddings are available on both sides,
-                # take the best score so old posts (DINOv2 only) still match
+                sim       = 0.0
+                threshold = 1.0  # default — won't match unless set below
+
                 if qvec_siglip and r["siglip_embedding"]:
-                    sim = max(sim, _cosine(qvec_siglip, json.loads(r["siglip_embedding"])))
-                if qvec_siglip and r["embedding"]:
-                    # cross-model: siglip query vs dino target — skip (incompatible spaces)
-                    pass
-                if qvec_dino and r["embedding"]:
-                    sim = max(sim, _cosine(qvec_dino, json.loads(r["embedding"])))
-                if sim >= 0.20:          # 20 % resemblance threshold
+                    # SigLIP↔SigLIP — semantically aware
+                    sim       = _cosine(qvec_siglip, json.loads(r["siglip_embedding"]))
+                    threshold = 0.50  # auto-notify: only fire for strong visual matches
+                elif qvec_dino and r["embedding"] and not r["siglip_embedding"]:
+                    # DINOv2 fallback for old posts without SigLIP embedding
+                    sim       = _cosine(qvec_dino, json.loads(r["embedding"]))
+                    threshold = 0.65  # DINOv2 is not semantic — need very high bar
+
+                if sim >= threshold:
                     scored.append({"id": r["id"], "title": r["title"],
                                    "image_url": r["image_url"], "score": round(sim, 3)})
             except Exception:
@@ -1313,6 +1387,9 @@ def _run_auto_match(post_id: str, emb_json, siglip_json, opp: str, author_uid: s
             broker.publish(f"user:{author_uid}", {
                 "type": "image_matches", "post_id": post_id, "matches": scored
             })
+            print(f"[auto-match] {len(scored)} matches for post {post_id}")
+        else:
+            print(f"[auto-match] no matches for post {post_id}")
     except Exception as e:
         print(f"[auto-match] {e}")
 
@@ -1501,9 +1578,10 @@ def _load_siglip():
     if _siglip_model is None:
         with _siglip_lock:
             if _siglip_model is None:
-                from transformers import AutoProcessor, AutoModel
-                # siglip2 requires transformers>=4.47, use siglip-base which works with 4.40
-                _siglip_proc  = AutoProcessor.from_pretrained(
+                from transformers import AutoModel, CLIPImageProcessor
+                # Use CLIPImageProcessor (image-only, no sentencepiece dependency)
+                # instead of AutoProcessor which also loads SiglipTokenizer
+                _siglip_proc  = CLIPImageProcessor.from_pretrained(
                     "google/siglip-base-patch16-224")
                 _siglip_model = AutoModel.from_pretrained(
                     "google/siglip-base-patch16-224")
@@ -1671,23 +1749,38 @@ def _qwen_parse_search(query: str) -> dict:
 
 
 # ── SigLIP2 helpers ───────────────────────────────────────────────────────────
+_siglip_text_proc = None
+_siglip_text_lock = threading.Lock()
+
+def _load_siglip_text():
+    """Load only the SigLIP text tokenizer — requires sentencepiece."""
+    global _siglip_text_proc
+    if _siglip_text_proc is None:
+        with _siglip_text_lock:
+            if _siglip_text_proc is None:
+                from transformers import AutoTokenizer
+                _siglip_text_proc = AutoTokenizer.from_pretrained(
+                    "google/siglip-base-patch16-224")
+    return _siglip_text_proc
+
 def _siglip_embed_image(img_bytes: bytes) -> list:
-    """Image embedding via SigLIP."""
+    """Image embedding via SigLIP — uses CLIPImageProcessor, no sentencepiece needed."""
     import torch
     proc, model = _load_siglip()
     img    = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     inputs = proc(images=img, return_tensors="pt")
     with torch.no_grad():
-        # SigLIPModel.get_image_features returns normalized embeddings directly
         feats = model.get_image_features(pixel_values=inputs["pixel_values"])
         feats = feats / feats.norm(dim=-1, keepdim=True)
     return feats.squeeze().tolist()
 
 def _siglip_embed_text(text: str) -> list:
-    """Text embedding via SigLIP — same vector space as image embeddings."""
+    """Text embedding via SigLIP — requires sentencepiece for tokenization."""
     import torch
-    proc, model = _load_siglip()
-    inputs = proc(text=[text], return_tensors="pt", padding="max_length", truncation=True)
+    tok   = _load_siglip_text()
+    _, model = _load_siglip()
+    inputs = tok(text=[text], return_tensors="pt", padding="max_length",
+                 truncation=True, max_length=64)
     with torch.no_grad():
         feats = model.get_text_features(input_ids=inputs["input_ids"])
         feats = feats / feats.norm(dim=-1, keepdim=True)
@@ -1706,16 +1799,37 @@ def _siglip_check_id(img_bytes: bytes) -> dict:
     try:
         proc, model = _load_florence()
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img.thumbnail((768, 768))
+        # Scale up small images so Florence OCR has enough resolution
+        w, h = img.size
+        if min(w, h) < 512:
+            scale = 512 / min(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        img.thumbnail((1024, 1024), Image.LANCZOS)
+
         inputs = proc(text="<OCR>", images=img, return_tensors="pt")
         with torch.no_grad():
             ids = model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
-                max_new_tokens=200, num_beams=1, do_sample=False,
+                max_new_tokens=300, num_beams=3, do_sample=False,
             )
-        ocr_text = proc.batch_decode(ids, skip_special_tokens=True)[0].strip().lower()
-        print(f"[id-check] OCR: {repr(ocr_text[:120])}")
+        # Use post_process_generation to correctly strip Florence location tokens.
+        # batch_decode with skip_special_tokens=True does NOT remove <loc_XYZ> tokens
+        # because they are regular vocab tokens, not registered special tokens —
+        # leaving "<loc_23><loc_45>student id<loc_87>" which breaks keyword matching.
+        raw = proc.batch_decode(ids, skip_special_tokens=False)[0]
+        try:
+            result = proc.post_process_generation(raw, task="<OCR>", image_size=(img.width, img.height))
+            if isinstance(result, dict):
+                ocr_text = " ".join(str(v) for v in result.values())
+            else:
+                ocr_text = str(result)
+        except Exception:
+            # Fallback: strip <loc_NNN> tokens with regex
+            ocr_text = re.sub(r'<loc_\d+>', ' ', raw)
+            ocr_text = re.sub(r'<[^>]+>', ' ', ocr_text)
+        ocr_text = re.sub(r'\s+', ' ', ocr_text).strip().lower()
+        print(f"[id-check] OCR ({len(ocr_text)} chars): {repr(ocr_text[:160])}")
     except Exception as e:
         print(f"[id-check] OCR failed: {e}")
 
@@ -1768,7 +1882,6 @@ def _siglip_check_id(img_bytes: bytes) -> dict:
             detected_role = "staff"
         elif student_hits:
             detected_role = "student"
-        # If both hit (unlikely), staff wins
         elif staff_hits:
             detected_role = "staff"
 
@@ -1800,48 +1913,40 @@ _migrate_badge()
 
 def _migrate_reports_unique():
     """
-    Fix: the old UNIQUE(post_id, reporter_id) constraint meant a user who
-    reported a post could never also report a comment on that same post.
-    The comment report hit the constraint and was silently dropped (INSERT OR IGNORE).
-
-    New: UNIQUE(post_id, reporter_id, reason) — post reports use plain reason strings
-    ('spam', 'fake', etc.) while comment reports use the prefix 'comment:<id>:<reason>',
-    so they are always distinct rows even for the same reporter on the same post.
+    The old UNIQUE(post_id, reporter_id) meant reporting a post and then
+    reporting a comment on that same post silently dropped the comment report
+    (INSERT OR IGNORE hit the constraint). Fix: UNIQUE(post_id, reporter_id, reason)
+    — post reports use a plain reason string, comment reports use 'comment:<id>:<reason>',
+    so they're always distinct rows. Runs as rename+recreate since SQLite can't
+    ALTER a UNIQUE constraint.
     """
     db = get_db()
     try:
-        # Detect old constraint by attempting two inserts that share (post_id, reporter_id)
-        # but differ in reason. If the second one is blocked, migration is needed.
+        # Detect old constraint: try inserting two rows with same post_id/reporter_id
+        # but different reason inside a savepoint — if second insert fails, migrate.
         test_post = db.execute("SELECT id, author_id FROM posts LIMIT 1").fetchone()
         if not test_post:
-            db.close()
-            return  # no posts yet — fresh install uses new schema from CREATE TABLE
-
-        needs_migration = False
+            db.close(); return  # fresh DB uses new schema already
+        needs = False
         try:
-            db.execute("SAVEPOINT _mig_test")
-            db.execute(
-                "INSERT INTO reports (id,post_id,reporter_id,reason) VALUES (?,?,?,?)",
-                ("__mig1__", test_post["id"], test_post["author_id"], "__test_post__")
-            )
-            db.execute(
-                "INSERT INTO reports (id,post_id,reporter_id,reason) VALUES (?,?,?,?)",
-                ("__mig2__", test_post["id"], test_post["author_id"], "comment:x:__test__")
-            )
-            db.execute("ROLLBACK TO SAVEPOINT _mig_test")
+            db.execute("SAVEPOINT _rmu")
+            db.execute("INSERT INTO reports (id,post_id,reporter_id,reason) VALUES (?,?,?,?)",
+                       ("__t1__", test_post["id"], test_post["author_id"], "__test_post__"))
+            db.execute("INSERT INTO reports (id,post_id,reporter_id,reason) VALUES (?,?,?,?)",
+                       ("__t2__", test_post["id"], test_post["author_id"], "comment:x:__test__"))
+            db.execute("ROLLBACK TO SAVEPOINT _rmu")
         except Exception:
-            db.execute("ROLLBACK TO SAVEPOINT _mig_test")
-            needs_migration = True
-
-        if needs_migration:
-            print("[migrate_reports] upgrading UNIQUE constraint to (post_id, reporter_id, reason)…")
+            db.execute("ROLLBACK TO SAVEPOINT _rmu")
+            needs = True
+        if needs:
+            print("[migrate_reports] upgrading UNIQUE constraint…")
             db.executescript("""
                 CREATE TABLE reports_new (
                     id          TEXT PRIMARY KEY,
                     post_id     TEXT NOT NULL REFERENCES posts(id),
                     reporter_id TEXT NOT NULL REFERENCES profiles(id),
-                    reason      TEXT NOT NULL DEFAULT \'\',
-                    created_at  TEXT NOT NULL DEFAULT (datetime(\'now\')),
+                    reason      TEXT NOT NULL DEFAULT '',
+                    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
                     UNIQUE(post_id, reporter_id, reason)
                 );
                 INSERT OR IGNORE INTO reports_new SELECT * FROM reports;
@@ -1849,8 +1954,6 @@ def _migrate_reports_unique():
                 ALTER TABLE reports_new RENAME TO reports;
             """)
             print("[migrate_reports] done ✓")
-        else:
-            print("[migrate_reports] constraint already correct, skipping")
     except Exception as e:
         print(f"[migrate_reports error] {e}")
     finally:
@@ -2252,12 +2355,12 @@ def _yolo_world_find_by_image(frame: Image.Image, query_img: Image.Image, thresh
     if img_hash not in _ref_image_query_cache:
         try:
             proc, model = _load_florence()
-            q = query_img.copy(); q.thumbnail((256, 256))
+            q = query_img.copy(); q.thumbnail((384, 384))
             inputs = proc(text="<MORE_DETAILED_CAPTION>", images=q, return_tensors="pt")
             with torch.no_grad():
                 ids = model.generate(
                     input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"],
-                    max_new_tokens=30, num_beams=1, do_sample=False,
+                    max_new_tokens=80, num_beams=3, do_sample=False,
                 )
             caption = proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
             query   = _extract_yolo_query(caption)
@@ -2266,7 +2369,7 @@ def _yolo_world_find_by_image(frame: Image.Image, query_img: Image.Image, thresh
             print(f"[ref-image error] {e}")
             query = "object"
 
-        # Pre-compute SigLIP embedding of the ref image (used for sliding window)
+        # Pre-compute SigLIP image embedding of ref (used for card/flat-item sliding window)
         ref_buf = _io.BytesIO()
         query_img.save(ref_buf, format="JPEG")
         ref_emb = _siglip_embed_image(ref_buf.getvalue())
@@ -2469,12 +2572,14 @@ async def find_in_frame(
             print(f"[camera] '{target}' → '{yolo_query}'")
             detections = _yolo_world_find(frame_img, yolo_query, threshold=0.01)
         elif ref_image:
-            # Image-only mode: describe the ref image once with Florence
+            # Image-only mode: Florence captions the ref image → extract noun → YOLO
             import hashlib, io as _refio
-            ref_bytes  = await ref_image.read()
-            ref_img    = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
+            ref_bytes = await ref_image.read()
+            ref_img   = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
             detections = _yolo_world_find_by_image(frame_img, ref_img)
-            # Get the actual noun Florence derived (cached after first call)
+            # Get the noun Florence derived (cached after first call) and return it
+            # so the frontend can send it as plain text on subsequent frames,
+            # skipping Florence entirely and matching the fast text-query path.
             buf = _refio.BytesIO(); ref_img.save(buf, format="JPEG", quality=60)
             yolo_query = (_ref_image_query_cache.get(hashlib.md5(buf.getvalue()).hexdigest()) or {}).get("query", "?")
         else:
