@@ -373,7 +373,7 @@ async def register_with_id(
                     broker.publish(f"user:{user_uid}", {
                         "type":    "badge_granted",
                         "badge":   badge,
-                        "message": f"{'🎓 Student' if badge == 'student' else '🏫 Staff' if badge == 'staff' else '✅ Verified'} badge added to your profile!",
+                        "message": f"{'Student' if badge == 'student' else 'Staff' if badge == 'staff' else 'Verified'} badge added to your profile!",
                     })
             except Exception as e:
                 print(f"[register-bg] id check error: {e}")
@@ -1160,7 +1160,7 @@ async def verify_badge(
                 "type":    "badge_result",
                 "ok":      True,
                 "badge":   badge,
-                "message": f"{'🎓 Student' if badge == 'student' else '🏫 Staff' if badge == 'staff' else '✅ Verified'} badge added!",
+                "message": f"{'Student' if badge == 'student' else 'Staff' if badge == 'staff' else 'Verified'} badge added!",
             })
         except Exception as e:
             print(f"[verify-badge] error: {e}")
